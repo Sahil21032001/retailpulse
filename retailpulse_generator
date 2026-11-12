@@ -1,0 +1,347 @@
+"""RetailPulse data generator.
+
+Standard library only, so it runs in a Databricks notebook or on your laptop.
+
+Notebook use (file sits next to your notebook in the Git folder):
+
+    import retailpulse_generator as g
+    g.generate(root="/Volumes/retailpulse/raw/landing", days=120)      # history
+    g.generate(root="/Volumes/retailpulse/raw/landing", live=True)     # one new batch "now"
+    g.generate(root="/Volumes/retailpulse/raw/landing", live=True, drift=True)  # adds new columns
+
+Command line use:
+
+    python retailpulse_generator.py --root ./landing --days 120
+    python retailpulse_generator.py --root ./landing --live
+
+Output folders under root: orders, customers, products, clicks, tickets, docs.
+The data contains deliberate flaws (duplicates, nulls, negative amounts, late events,
+inconsistent casing) so the cleaning and data quality phases have real work to do.
+"""
+import argparse
+import csv
+import json
+import os
+import random
+from datetime import datetime, timedelta, timezone
+
+CATEGORIES = {
+    "Electronics": (30, 600, ["Headphones", "Speaker", "Charger", "Webcam", "Keyboard", "Monitor"]),
+    "Home": (10, 200, ["Lamp", "Kettle", "Blender", "Cushion", "Vacuum", "Shelf"]),
+    "Fashion": (15, 150, ["Jacket", "Sneakers", "Backpack", "Watch", "Scarf", "Jeans"]),
+    "Beauty": (5, 80, ["Serum", "Moisturiser", "Perfume", "Shampoo", "Lipstick", "Sunscreen"]),
+    "Sports": (12, 300, ["Yoga Mat", "Dumbbells", "Bottle", "Tent", "Racket", "Helmet"]),
+    "Books": (6, 40, ["Novel", "Cookbook", "Biography", "Atlas", "Workbook", "Comic"]),
+}
+ADJECTIVES = ["Classic", "Pro", "Mini", "Ultra", "Eco", "Smart", "Prime", "Lite"]
+FIRST = ["Aarav", "Maya", "Liam", "Sofia", "Noah", "Isha", "Ethan", "Zara", "Lucas", "Anika", "Omar", "Priya"]
+LAST = ["Sharma", "Patel", "Garcia", "Smith", "Khan", "Iyer", "Brown", "Nair", "Lopez", "Singh", "Chen", "Das"]
+REGIONS = ["North", "South", "East", "West"]
+SEGMENTS = ["standard", "premium", "student"]
+CHANNELS = ["web", "mobile_app", "marketplace"]
+DEVICES = ["desktop", "mobile", "tablet"]
+STATUSES = ["delivered", "shipped", "cancelled", "returned"]
+STATUS_WEIGHTS = [0.85, 0.06, 0.05, 0.04]
+
+TICKETS = {
+    "delivery": [
+        ("Where is my order?", "Hi, my order was due last week and the tracking has not moved. Could you check, please?"),
+        ("Late delivery again", "This is the second time my delivery is late. I am very frustrated and thinking of shopping elsewhere."),
+        ("Delivery status", "Quick question, how long does standard shipping usually take to my region?"),
+    ],
+    "refund": [
+        ("Refund not received", "I returned my item two weeks ago and still have no refund. This is unacceptable."),
+        ("How do refunds work?", "Hello, I would like to return a jacket. How long does the refund take?"),
+        ("Refund question", "Thanks for the quick delivery! I need to return one item, what is the process?"),
+    ],
+    "defect": [
+        ("Item arrived broken", "The speaker I ordered arrived with a cracked casing. I want a replacement immediately."),
+        ("Product stopped working", "My headphones stopped working after a month. Is this covered by warranty?"),
+        ("Small issue with my order", "One of the books has a torn cover. Not a big deal, but can it be swapped?"),
+    ],
+    "payment": [
+        ("Charged twice", "I was charged twice for the same order. Fix this today or I will dispute it with my bank."),
+        ("Payment failed", "My card payment failed but the money left my account. Can you confirm the status?"),
+        ("Which payment methods?", "Do you accept UPI and wallets, or only cards?"),
+    ],
+    "account": [
+        ("Cannot log in", "I cannot log in to my account even after resetting my password. Very annoying."),
+        ("Change my email", "Please help me update the email address on my account."),
+        ("Delete my data", "I would like to know how to delete my account and personal data."),
+    ],
+}
+PRIORITY = {"delivery": "medium", "refund": "high", "defect": "high", "payment": "high", "account": "low"}
+
+POLICY_DOCS = {
+    "returns_policy.md": """# RetailPulse Returns Policy
+
+Customers may return most items within 30 days of delivery. Items must be unused and in original packaging.
+Electronics can be returned within 15 days if unopened, or within 30 days if faulty.
+Refunds are issued to the original payment method within 5 to 7 business days after we receive the item.
+Return shipping is free for faulty or wrong items. For other returns, a flat fee of 4.99 is deducted from the refund.
+Perfume, opened beauty products and gift cards cannot be returned.
+""",
+    "shipping_policy.md": """# RetailPulse Shipping Policy
+
+Standard shipping takes 3 to 5 business days and is free on orders over 50. Orders under 50 pay a flat 4.99 fee.
+Express shipping takes 1 to 2 business days and costs 12.99 for every order.
+Orders placed before 2 pm on a business day are dispatched the same day.
+Marketplace orders are shipped by the seller and may take up to 10 business days.
+We cannot ship to PO boxes. Tracking links are emailed once an order is dispatched.
+""",
+    "warranty_policy.md": """# RetailPulse Warranty Policy
+
+Electronics carry a 12 month warranty from the delivery date. Home appliances carry a 24 month warranty.
+Fashion, beauty, sports and book items carry no warranty beyond the 30 day return window.
+The warranty covers manufacturing defects only. Accidental damage, water damage and unauthorised repairs are excluded.
+To claim, contact support with the order number and a photo of the fault. We repair or replace within 10 business days.
+""",
+    "payments_faq.md": """# RetailPulse Payments FAQ
+
+We accept major credit and debit cards, UPI and popular digital wallets. We do not accept cash on delivery.
+A failed payment that debits your account is automatically reversed within 3 to 5 business days.
+If you are charged twice for one order, contact support and the duplicate charge is refunded within 5 business days.
+Gift cards can be combined with one other payment method per order.
+""",
+    "privacy_policy.md": """# RetailPulse Privacy Policy
+
+We collect your name, email, phone number, delivery address and order history to fulfil orders and provide support.
+We keep order records for 7 years for tax reasons. Support tickets are kept for 2 years.
+You can request a copy or deletion of your personal data by contacting support. Deletion requests are completed within 30 days.
+We do not sell personal data. Clickstream data is used only to improve the site and is stored without names.
+""",
+}
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_lines(path, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def _write_csv(path, rows, columns):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c: row.get(c, "") for c in columns})
+
+
+def make_products(rng, n):
+    products = []
+    names = list(CATEGORIES.items())
+    for i in range(1, n + 1):
+        category, (low, high, nouns) = names[(i - 1) % len(names)]
+        price = round(rng.uniform(low, high), 2)
+        products.append({
+            "product_id": f"P{i:04d}",
+            "product_name": f"{rng.choice(ADJECTIVES)} {rng.choice(nouns)}",
+            "category": category,
+            "list_price": price,
+            "cost": round(price * rng.uniform(0.45, 0.75), 2),
+        })
+    return products
+
+
+def make_customers(rng, n, days):
+    """Each customer has a hidden activity rate and, for about 25%, a churn day.
+    After the churn day the customer stops ordering, and tickets rise just before it.
+    That gives a churn model real signal to learn."""
+    customers = []
+    for i in range(1, n + 1):
+        first, last = rng.choice(FIRST), rng.choice(LAST)
+        signup_day = rng.randint(-300, days - 1)
+        churn_day = None
+        if rng.random() < 0.25:
+            low = max(signup_day + 20, 20)
+            if low < days:
+                churn_day = rng.randint(low, days - 1)
+        customers.append({
+            "customer_id": f"C{i:05d}",
+            "name": f"{first} {last}",
+            "email": f"{first.lower()}.{last.lower()}{i}@example.com",
+            "phone": f"+91-9{rng.randint(100000000, 999999999)}",
+            "region": rng.choice(REGIONS),
+            "segment": rng.choices(SEGMENTS, weights=[0.7, 0.2, 0.1])[0],
+            "signup_day": signup_day,
+            "churn_day": churn_day,
+            "rate": rng.uniform(0.01, 0.12),
+        })
+    return customers
+
+
+def _active(customer, day):
+    if customer["signup_day"] > day:
+        return False
+    return customer["churn_day"] is None or day < customer["churn_day"]
+
+
+def make_batch(rng, customers, products, day, start, span_seconds, scale, drift, clicks_per_day, tickets_per_day):
+    tag = start.strftime("%Y%m%d%H%M%S")
+    active = [c for c in customers if _active(c, day)]
+    by_id = {p["product_id"]: p for p in products}
+
+    # Orders
+    orders = []
+    for c in active:
+        if rng.random() < c["rate"] * scale:
+            ts = start + timedelta(seconds=rng.randint(0, max(1, span_seconds - 1)))
+            items = []
+            for p in rng.sample(products, rng.randint(1, 4)):
+                items.append({"product_id": p["product_id"], "quantity": rng.randint(1, 3), "unit_price": p["list_price"]})
+            total = round(sum(i["quantity"] * i["unit_price"] for i in items), 2)
+            status = rng.choices(STATUSES, weights=STATUS_WEIGHTS)[0]
+            order = {
+                "order_id": f"O{tag}{len(orders):04d}",
+                "customer_id": c["customer_id"],
+                "order_ts": _iso(ts),
+                "status": status,
+                "channel": rng.choice(CHANNELS),
+                "currency": "USD",
+                "total_amount": total,
+                "items": items,
+            }
+            if drift:
+                order["coupon_code"] = rng.choice([None, None, None, "WELCOME10", "FESTIVE15"])
+            roll = rng.random()
+            if roll < 0.005:
+                order["total_amount"] = -abs(total)       # bad amount
+            elif roll < 0.010:
+                order["customer_id"] = None               # missing customer
+            elif roll < 0.020:
+                order["status"] = status.upper()          # inconsistent casing
+            orders.append(order)
+    orders += [dict(o) for o in rng.sample(orders, int(len(orders) * 0.01))]  # exact duplicates
+
+    # Clickstream
+    clicks = []
+    sessions = max(1, int(clicks_per_day * scale / 3))
+    for s in range(sessions):
+        customer = rng.choice(active) if active and rng.random() < 0.7 else None
+        base = start + timedelta(seconds=rng.randint(0, max(1, span_seconds - 1)))
+        device = rng.choice(DEVICES)
+        sequence = ["search"] + ["view"] * rng.randint(1, 3)
+        if rng.random() < 0.3:
+            sequence.append("add_to_cart")
+            if rng.random() < 0.5:
+                sequence.append("purchase")
+        for k, event_type in enumerate(sequence):
+            ts = base + timedelta(seconds=30 * k + rng.randint(0, 20))
+            if rng.random() < 0.02:
+                ts -= timedelta(minutes=rng.randint(30, 180))   # late event
+            clicks.append({
+                "event_id": f"E{tag}{len(clicks):06d}",
+                "session_id": f"S{tag}{s:05d}",
+                "customer_id": customer["customer_id"] if customer else None,
+                "product_id": rng.choice(products)["product_id"],
+                "event_type": event_type,
+                "device": device,
+                "event_ts": _iso(ts),
+            })
+    clicks += [dict(e) for e in rng.sample(clicks, int(len(clicks) * 0.01))]
+
+    # Support tickets, more likely from customers about to churn
+    tickets = []
+    about_to_churn = [c for c in active if c["churn_day"] is not None and c["churn_day"] - day <= 14]
+    for t in range(int(tickets_per_day * scale + rng.random())):
+        pool = about_to_churn if about_to_churn and rng.random() < 0.5 else active
+        if not pool:
+            break
+        c = rng.choice(pool)
+        topic = rng.choice(list(TICKETS))
+        subject, body = rng.choice(TICKETS[topic])
+        ts = start + timedelta(seconds=rng.randint(0, max(1, span_seconds - 1)))
+        tickets.append({
+            "ticket_id": f"T{tag}{t:04d}",
+            "customer_id": c["customer_id"],
+            "created_ts": _iso(ts),
+            "subject": subject,
+            "body": body,
+            "priority": PRIORITY[topic],
+        })
+
+    # Customer changes: all existing on the first day, then new sign-ups and ~1% edits
+    changed = []
+    for c in customers:
+        is_new = c["signup_day"] == day or (day == 0 and c["signup_day"] <= 0)
+        edited = c["signup_day"] < day and rng.random() < 0.01
+        if edited:
+            if rng.random() < 0.5:
+                c["region"] = rng.choice(REGIONS)
+            else:
+                c["email"] = c["email"].replace("@example.com", f".{rng.randint(1, 99)}@example.com")
+        if is_new or edited:
+            row = dict(c)
+            row["signup_date"] = (start - timedelta(days=day - c["signup_day"])).strftime("%Y-%m-%d")
+            row["updated_at"] = _iso(start + timedelta(seconds=rng.randint(0, 3600)))
+            if drift:
+                row["loyalty_tier"] = rng.choice(["bronze", "silver", "gold"])
+            changed.append(row)
+    return tag, orders, clicks, tickets, changed
+
+
+def generate(root="./landing", days=120, customers=3000, products=300, seed=42,
+             live=False, drift=False, clicks_per_day=1200, tickets_per_day=12):
+    """Write files under root. history mode writes one file set per day for `days` days.
+    live mode writes one small batch stamped with the current time."""
+    for folder in ("orders", "customers", "products", "clicks", "tickets", "docs"):
+        os.makedirs(os.path.join(root, folder), exist_ok=True)
+
+    world = random.Random(seed)   # same customers and products every run
+    product_rows = make_products(world, products)
+    customer_rows = make_customers(world, customers, days)
+
+    product_path = os.path.join(root, "products", "products.csv")
+    if not os.path.exists(product_path):
+        _write_csv(product_path, product_rows, ["product_id", "product_name", "category", "list_price", "cost"])
+    for name, text in POLICY_DOCS.items():
+        path = os.path.join(root, "docs", name)
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+    customer_cols = ["customer_id", "name", "email", "phone", "region", "segment", "signup_date", "updated_at"]
+    if drift:
+        customer_cols.append("loyalty_tier")
+
+    if live:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        rng = random.Random(seed + int(now.timestamp()))
+        batches = [(days, now - timedelta(minutes=10), 600, 0.05)]
+    else:
+        rng = random.Random(seed + 1)
+        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        batches = [(d, today - timedelta(days=days - d), 86400, 1.0) for d in range(days)]
+
+    totals = {"orders": 0, "clicks": 0, "tickets": 0, "customers": 0}
+    for day, start, span, scale in batches:
+        tag, orders, clicks, tickets, changed = make_batch(
+            rng, customer_rows, product_rows, day, start, span, scale, drift, clicks_per_day, tickets_per_day)
+        _write_lines(os.path.join(root, "orders", f"orders_{tag}.json"), orders)
+        _write_lines(os.path.join(root, "clicks", f"clicks_{tag}.json"), clicks)
+        _write_lines(os.path.join(root, "tickets", f"tickets_{tag}.json"), tickets)
+        if changed:
+            _write_csv(os.path.join(root, "customers", f"customers_{tag}.csv"), changed, customer_cols)
+        totals["orders"] += len(orders)
+        totals["clicks"] += len(clicks)
+        totals["tickets"] += len(tickets)
+        totals["customers"] += len(changed)
+    print(f"Wrote {len(batches)} batch(es) to {root}: {totals}")
+    return totals
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate RetailPulse sample data")
+    parser.add_argument("--root", default="./landing")
+    parser.add_argument("--days", type=int, default=120)
+    parser.add_argument("--customers", type=int, default=3000)
+    parser.add_argument("--products", type=int, default=300)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--drift", action="store_true")
+    args = parser.parse_args()
+    generate(args.root, args.days, args.customers, args.products, args.seed, args.live, args.drift)
